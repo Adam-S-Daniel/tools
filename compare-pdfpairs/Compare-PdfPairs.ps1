@@ -27,7 +27,18 @@
     Max parallel pair comparisons. Defaults to processor count.
 
 .EXAMPLE
-    ./Compare-PdfPairs.ps1 -Directory ./docs -Suffix '-signed'
+    $comparisonResults = . .\Compare-PdfPairs.ps1 -Directory (Join-Path $env:USERPROFILE 'OneDrive') -Suffix '-needsocr'
+    $comparisonResults | ? { -not $_.IdenticalPrintout -or -not $_.IdenticalText } | 
+        Select Original, Suffixed, PageCountA, PageCountB, IdenticalPrintout, TextLengthA, TextLengthB, IdenticalText, TextDiffLines
+
+
+.EXAMPLE
+    $comparisonResults = . .\Compare-PdfPairs.ps1 -Directory (Join-Path $env:USERPROFILE 'OneDrive') -Suffix '-needsocr'
+    $comparisonResults | ? { $_.IdenticalPrintout -and ($_.IdenticalText -or ($_.TextLengthA -gt 0 -and $_.TextLengthB -eq 0)) } | select Suffixed -ExpandProperty Suffixed |
+      Remove-Item -WhatIf
+
+
+        
 #>
 [CmdletBinding()]
 param(
@@ -38,7 +49,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-foreach ($tool in 'pdftoppm','pdftotext') {
+foreach ($tool in 'pdftoppm', 'pdftotext') {
     if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
         throw "Required tool '$tool' not found on PATH. Install poppler-utils."
     }
@@ -52,20 +63,17 @@ if ([string]::IsNullOrEmpty($Suffix)) {
 }
 
 # Find suffixed PDFs that have an un-suffixed sibling in the same folder.
-Write-Progress -Id 0 -Activity 'Scanning for PDF pairs' -Status $Directory
 $pairs = Get-ChildItem -LiteralPath $Directory -Recurse -File -Filter '*.pdf' |
-    Where-Object {
-        $_.BaseName.EndsWith($Suffix) -and $_.BaseName.Length -gt $Suffix.Length
-    } |
-    ForEach-Object {
-        $base = $_.BaseName.Substring(0, $_.BaseName.Length - $Suffix.Length)
-        $sibling = Join-Path $_.DirectoryName ($base + '.pdf')
-        if (Test-Path -LiteralPath $sibling -PathType Leaf) {
-            [pscustomobject]@{ Original = $sibling; Suffixed = $_.FullName }
-        }
+Where-Object {
+    $_.BaseName.EndsWith($Suffix) -and $_.BaseName.Length -gt $Suffix.Length
+} |
+ForEach-Object {
+    $base = $_.BaseName.Substring(0, $_.BaseName.Length - $Suffix.Length)
+    $sibling = Join-Path $_.DirectoryName ($base + '.pdf')
+    if (Test-Path -LiteralPath $sibling -PathType Leaf) {
+        [pscustomobject]@{ Original = $sibling; Suffixed = $_.FullName }
     }
-
-Write-Progress -Id 0 -Activity 'Scanning for PDF pairs' -Completed
+}
 
 if (-not $pairs) {
     Write-Host "No pairs found under '$Directory' with suffix '$Suffix'."
@@ -75,42 +83,37 @@ if (-not $pairs) {
 $total = @($pairs).Count
 Write-Host "Comparing $total pair(s) with up to $ThrottleLimit in parallel..."
 
-# Shared thread-safe counter for progress across parallel workers.
-$counter = [int[]]::new(1)
-
 $results = $pairs | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
     $pair = $_
     $a = $pair.Original
     $b = $pair.Suffixed
 
-    $counterRef = $using:counter
-    $totalRef   = $using:total
-    $workerId   = [System.Threading.Thread]::CurrentThread.ManagedThreadId
+    $workerId = [System.Threading.Thread]::CurrentThread.ManagedThreadId
 
     Write-Progress -Id $workerId -ParentId 0 `
         -Activity "Worker $workerId" `
         -Status ("Comparing " + [IO.Path]::GetFileName($a))
 
-    $tmp  = Join-Path ([IO.Path]::GetTempPath()) ("pdfcmp_" + [Guid]::NewGuid())
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("pdfcmp_" + [Guid]::NewGuid())
     $dirA = Join-Path $tmp 'a'
     $dirB = Join-Path $tmp 'b'
-    New-Item -ItemType Directory -Path $dirA,$dirB -Force | Out-Null
+    New-Item -ItemType Directory -Path $dirA, $dirB -Force | Out-Null
 
     try {
         # Rasterize + extract text for both files concurrently.
         $jobs = @(
             Start-ThreadJob -ScriptBlock {
-                param($f,$d) & pdftoppm -r 150 -png $f (Join-Path $d 'page') 2>$null
-            } -ArgumentList $a,$dirA
+                param($f, $d) & pdftoppm -r 150 -png $f (Join-Path $d 'page') 2>$null
+            } -ArgumentList $a, $dirA
             Start-ThreadJob -ScriptBlock {
-                param($f,$d) & pdftoppm -r 150 -png $f (Join-Path $d 'page') 2>$null
-            } -ArgumentList $b,$dirB
+                param($f, $d) & pdftoppm -r 150 -png $f (Join-Path $d 'page') 2>$null
+            } -ArgumentList $b, $dirB
             Start-ThreadJob -ScriptBlock {
-                param($f,$o) & pdftotext -layout $f $o 2>$null
-            } -ArgumentList $a,(Join-Path $tmp 'a.txt')
+                param($f, $o) & pdftotext -layout $f $o 2>$null
+            } -ArgumentList $a, (Join-Path $tmp 'a.txt')
             Start-ThreadJob -ScriptBlock {
-                param($f,$o) & pdftotext -layout $f $o 2>$null
-            } -ArgumentList $b,(Join-Path $tmp 'b.txt')
+                param($f, $o) & pdftotext -layout $f $o 2>$null
+            } -ArgumentList $b, (Join-Path $tmp 'b.txt')
         )
         $jobs | Wait-Job | Receive-Job | Out-Null
         $jobs | Remove-Job
@@ -119,60 +122,47 @@ $results = $pairs | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
         $imgsA = Get-ChildItem -LiteralPath $dirA -Filter '*.png' | Sort-Object Name
         $imgsB = Get-ChildItem -LiteralPath $dirB -Filter '*.png' | Sort-Object Name
 
-        $identical = $false
+        $identicalPrintout = $false
         if ($imgsA.Count -gt 0 -and $imgsA.Count -eq $imgsB.Count) {
-            $identical = $true
+            $identicalPrintout = $true
             for ($i = 0; $i -lt $imgsA.Count; $i++) {
                 $hA = (Get-FileHash -LiteralPath $imgsA[$i].FullName -Algorithm SHA256).Hash
                 $hB = (Get-FileHash -LiteralPath $imgsB[$i].FullName -Algorithm SHA256).Hash
-                if ($hA -ne $hB) { $identical = $false; break }
+                if ($hA -ne $hB) { $identicalPrintout = $false; break }
             }
         }
 
         # Text diff.
         $txtA = Join-Path $tmp 'a.txt'
         $txtB = Join-Path $tmp 'b.txt'
-        $linesA = if (Test-Path -LiteralPath $txtA) { Get-Content -LiteralPath $txtA } else { @() }
-        $linesB = if (Test-Path -LiteralPath $txtB) { Get-Content -LiteralPath $txtB } else { @() }
+        $linesA = if (Test-Path -LiteralPath $txtA) { Get-Content -LiteralPath $txtA } else { $null }
+        $linesB = if (Test-Path -LiteralPath $txtB) { Get-Content -LiteralPath $txtB } else { $null }
 
-        $diffLines = Compare-Object -ReferenceObject $linesA -DifferenceObject $linesB |
-            ForEach-Object {
-                $marker = if ($_.SideIndicator -eq '<=') { '- ' } else { '+ ' }
-                $marker + $_.InputObject
-            }
-
+        $diff = Compare-Object -ReferenceObject $linesA -DifferenceObject $linesB
+        $diffLines = $diff | ForEach-Object {
+            $marker = if ($_.SideIndicator -eq '<=') { '- ' } else { '+ ' }
+            $marker + $_.InputObject
+        }
+        
         [pscustomobject]@{
             Original          = $a
             Suffixed          = $b
             PageCountA        = $imgsA.Count
             PageCountB        = $imgsB.Count
-            IdenticalPrintout = $identical
-            TextDiff          = if ($diffLines) { $diffLines -join [Environment]::NewLine }
-                                else { '(no text differences)' }
+            IdenticalPrintout = $identicalPrintout
+            TextLengthA       = [string]::IsNullOrWhiteSpace($linesA) ? 0 : $linesA.Length
+            TextLengthB       = [string]::IsNullOrWhiteSpace($linesB) ? 0 : $linesB.Length
+            # TextLinesA        = $linesA
+            # TextLinesB        = $linesB
+            IdenticalText     = ($null -eq $diff)
+            TextDiff          = $diff
+            TextDiffLines     = $diffLines
         }
     }
     finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
-        $done = [System.Threading.Interlocked]::Increment([ref]$counterRef[0])
-        Write-Progress -Id $workerId -Activity "Worker $workerId" -Completed
-        Write-Progress -Id 0 -Activity 'Comparing PDF pairs' `
-            -Status "$done / $totalRef complete" `
-            -PercentComplete ([int](100 * $done / $totalRef))
+        # Invoke-Item -LiteralPath $tmp
     }
 }
 
-Write-Progress -Id 0 -Activity 'Comparing PDF pairs' -Completed
-
-# Emit results (serial to keep output readable).
-foreach ($r in $results) {
-    Write-Host ('=' * 80)
-    Write-Host "A: $($r.Original)"
-    Write-Host "B: $($r.Suffixed)"
-    Write-Host "Pages: $($r.PageCountA) vs $($r.PageCountB)"
-    Write-Host "Identical printout: $($r.IdenticalPrintout)"
-    Write-Host "Text diff:"
-    Write-Host $r.TextDiff
-}
-
-# Also return the objects on the pipeline for downstream consumption.
 $results
